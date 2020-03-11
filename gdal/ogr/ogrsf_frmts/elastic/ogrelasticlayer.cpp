@@ -7,6 +7,7 @@
  ******************************************************************************
  * Copyright (c) 2011, Adam Estrada
  * Copyright (c) 2012-2016, Even Rouault <even dot rouault at mines-paris dot org>
+ * Copyright (c) 2020, CNES
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -41,8 +42,9 @@
 
 #include <cstdlib>
 #include <set>
+#include <iostream>
 
-CPL_CVSID("$Id$")
+CPL_CVSID("$Id: ogrelasticlayer.cpp d1fbcf9f2c25f9cd9ac444761cde8c7b39338fc2 2019-06-10 15:16:26 -0700 Nick Peihl $")
 
 /************************************************************************/
 /*                           OGRElasticLayer()                          */
@@ -78,6 +80,7 @@ OGRElasticLayer::OGRElasticLayer( const char* pszLayerName,
     m_nNextFID(-1),
     m_iCurFeatureInPage(0),
     m_bEOF(false),
+    bGeoJSONDocument(true),
     m_poSpatialFilter(nullptr),
     m_bFilterMustBeClientSideEvaluated(false),
     m_poJSONFilter(nullptr),
@@ -100,6 +103,7 @@ OGRElasticLayer::OGRElasticLayer( const char* pszLayerName,
     }
 
     const char* pszStoredFields = CSLFetchNameValue(papszOptions, "STORED_FIELDS");
+
     if( pszStoredFields )
         m_papszStoredFields = CSLTokenizeString2(pszStoredFields, ",", 0);
 
@@ -118,6 +122,7 @@ OGRElasticLayer::OGRElasticLayer( const char* pszLayerName,
                                             pszFieldsWithRawValue, ",", 0);
 
     SetDescription( m_poFeatureDefn->GetName() );
+
     m_poFeatureDefn->Reference();
     m_poFeatureDefn->SetGeomType(wkbNone);
 
@@ -492,6 +497,7 @@ void OGRElasticLayer::CreateFieldFromSchema(const char* pszName,
     }
 }
 
+
 /************************************************************************/
 /*                        FinalizeFeatureDefn()                         */
 /************************************************************************/
@@ -510,34 +516,20 @@ void OGRElasticLayer::FinalizeFeatureDefn(bool bReadFeatures)
 
     if( bReadFeatures && nFeatureCountToEstablishFeatureDefn != 0 )
     {
-        //CPLDebug("ES", "Try to get %d features to establish feature definition",
-        //         FeatureCountToEstablishFeatureDefn);
         bool bFirst = true;
         int nAlreadyQueried = 0;
         while( true )
         {
             CPLString osRequest;
             CPLString osPostData;
-            if( bFirst )
-            {
+            if (bFirst) {
                 bFirst = false;
-                if(  !m_osESSearch.empty() )
-                {
-                    osRequest = CPLSPrintf("%s/_search?scroll=1m&size=%d",
-                           m_poDS->GetURL(), m_poDS->m_nBatchSize);
-                    osPostData = m_osESSearch;
-                }
-                else
-                    osRequest = CPLSPrintf("%s/%s/%s/_search?scroll=1m&size=%d",
-                           m_poDS->GetURL(), m_osIndexName.c_str(),
-                           m_osMappingName.c_str(), m_poDS->m_nBatchSize);
-            }
-            else
-            {
-                if( m_osScrollID.empty() )
-                    break;
-                osRequest = CPLSPrintf("%s/_search/scroll?scroll=1m&scroll_id=%s",
-                               m_poDS->GetURL(), m_osScrollID.c_str());
+                osRequest = CPLSPrintf("%s/%s/%s/_search?",
+                    m_poDS->GetURL(), m_osIndexName.c_str(),
+                    m_osMappingName.c_str());
+                osPostData = CPLSPrintf(
+                    "{\"size\":0,\"aggs\":{\"grid\":{\"geohash_grid\":{\"field\":\"%s\",\"precision\":3},\"aggs\":{\"1\":{\"geo_centroid\":{\"field\":\"%s\"}}}}}}",
+                    m_poFeatureDefn->GetGeomFieldDefn(0)->GetNameRef(), m_poFeatureDefn->GetGeomFieldDefn(0)->GetNameRef());
             }
 
             if( m_bAddPretty )
@@ -547,116 +539,62 @@ void OGRElasticLayer::FinalizeFeatureDefn(bool bReadFeatures)
             {
                 break;
             }
-            json_object* poScrollID = CPL_json_object_object_get(poResponse, "_scroll_id");
-            if( poScrollID )
+
+            json_object* poAggregations = CPL_json_object_object_get(poResponse, "aggregations");
+            if( poAggregations == nullptr || json_object_get_type(poAggregations) != json_type_object )
             {
-                const char* pszScrollID = json_object_get_string(poScrollID);
-                if( pszScrollID )
-                    m_osScrollID = pszScrollID;
+                json_object_put(poResponse);
+                break;
+            }
+            json_object* poGrid = CPL_json_object_object_get(poAggregations, "grid");
+            if( poGrid == nullptr || json_object_get_type(poGrid) != json_type_object )
+            {
+                json_object_put(poResponse);
+                break;
+            }
+            json_object* poBuckets = CPL_json_object_object_get(poGrid, "buckets");
+            if( poBuckets == nullptr || json_object_get_type(poBuckets) != json_type_array )
+            {
+                json_object_put(poResponse);
+                break;
             }
 
-            json_object* poHits = json_ex_get_object_by_path(poResponse, "hits.hits");
-            if( poHits == nullptr || json_object_get_type(poHits) != json_type_array )
+            int nBuckets = json_object_array_length(poBuckets);
+            if( nBuckets == 0 )
             {
                 json_object_put(poResponse);
                 break;
             }
-            int nHits = json_object_array_length(poHits);
-            if( nHits == 0 )
+
+            for( int i = 0; i < nBuckets; i++ )
             {
-                m_osScrollID = "";
-                json_object_put(poResponse);
-                break;
-            }
-            for(int i=0;i<nHits;i++)
-            {
-                json_object* poHit = json_object_array_get_idx(poHits, i);
-                if( poHit == nullptr || json_object_get_type(poHit) != json_type_object )
+                json_object* poBucket = json_object_array_get_idx(poBuckets, i);
+                if( poBucket == nullptr || json_object_get_type(poBucket) != json_type_object )
                 {
                     continue;
                 }
-                json_object* poSource = CPL_json_object_object_get(poHit, "_source");
+                json_object* poSource = CPL_json_object_object_get(poBucket, "1");
                 if( poSource == nullptr || json_object_get_type(poSource) != json_type_object )
                 {
                     continue;
                 }
-
-                if( !m_osESSearch.empty() )
+                json_object* poLocation = CPL_json_object_object_get(poSource, "location");
+                if( poLocation == nullptr || json_object_get_type(poLocation) != json_type_object )
                 {
-                    json_object* poIndex = CPL_json_object_object_get(poHit, "_index");
-                    if( poIndex == nullptr || json_object_get_type(poIndex) != json_type_string )
-                        break;
-                    json_object* poType = CPL_json_object_object_get(poHit, "_type");
-                    if( poType == nullptr || json_object_get_type(poType) != json_type_string )
-                        break;
-                    CPLString osIndex(json_object_get_string(poIndex));
-                    m_osMappingName = json_object_get_string(poType);
-
-                    if( oVisited.find( std::pair<CPLString,CPLString>(osIndex, m_osMappingName) ) == oVisited.end() )
-                    {
-                        oVisited.insert( std::pair<CPLString,CPLString>(osIndex, m_osMappingName) );
-
-                        json_object* poMappingRes = m_poDS->RunRequest(
-                            (m_poDS->GetURL() + CPLString("/") + osIndex + CPLString("/_mapping/") + m_osMappingName + CPLString("?pretty")).c_str());
-                        if( poMappingRes )
-                        {
-                            json_object* poLayerObj = CPL_json_object_object_get(poMappingRes, osIndex);
-                            json_object* poMappings = nullptr;
-                            if( poLayerObj && json_object_get_type(poLayerObj) == json_type_object )
-                                poMappings = CPL_json_object_object_get(poLayerObj, "mappings");
-                            if( poMappings && json_object_get_type(poMappings) == json_type_object )
-                            {
-                                json_object* poMapping = CPL_json_object_object_get(poMappings, m_osMappingName);
-                                if( poMapping)
-                                {
-                                    InitFeatureDefnFromMapping(poMapping, "", std::vector<CPLString>());
-                                }
-                            }
-                            json_object_put(poMappingRes);
-                        }
-                    }
+                    continue;
                 }
+                int pszDensity = 0;
+                json_object* poDensity = CPL_json_object_object_get(poBucket, "doc_count");
+                if( poDensity != nullptr && json_object_get_type(poDensity) == json_type_int )
+                    pszDensity = json_object_get_int(poDensity);
 
-                json_object_iter it;
-                it.key = nullptr;
-                it.val = nullptr;
-                it.entry = nullptr;
-                json_object_object_foreachC( poSource, it )
-                {
-                    if( !m_osFID.empty() )
-                    {
-                        if( EQUAL(it.key, m_osFID) )
-                            continue;
-                    }
-                    else if( EQUAL(it.key, m_poDS->GetFID()) )
-                    {
-                        m_osFID = it.key;
-                        continue;
-                    }
+                json_object *obj = json_object_new_object();
+                json_object_object_add(obj, "weight", json_object_new_int(pszDensity));
 
-                    if( m_osMappingName == "FeatureCollection" )
-                    {
-                        if( strcmp(it.key, "properties") == 0 &&
-                            json_object_get_type(it.val) == json_type_object )
-                        {
-                            json_object_iter it2;
-                            it2.key = nullptr;
-                            it2.val = nullptr;
-                            it2.entry = nullptr;
-                            json_object_object_foreachC( it.val, it2 )
-                            {
-                                std::vector<CPLString> aosPath;
-                                aosPath.push_back("properties");
-                                AddOrUpdateField(it2.key, it2.key, it2.val, '.', aosPath);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        std::vector<CPLString> aosPath;
-                        AddOrUpdateField(it.key, it.key, it.val, '.', aosPath);
-                    }
-                }
+                std::vector<CPLString> aosPath1;
+                AddOrUpdateField("test_point", "test_point", poLocation, '.', aosPath1);
+                std::vector<CPLString> aosPath2;
+                AddOrUpdateField("properties", "properties", obj, '.', aosPath2);
 
                 nAlreadyQueried ++;
                 if( nFeatureCountToEstablishFeatureDefn > 0 &&
@@ -683,6 +621,196 @@ void OGRElasticLayer::FinalizeFeatureDefn(bool bReadFeatures)
         AddFieldDefn("_json", OFTString, std::vector<CPLString>() );
     }
 }
+
+/************************************************************************/
+/*                        FinalizeFeatureDefn()                         */
+/************************************************************************/
+
+//void OGRElasticLayer::FinalizeFeatureDefn(bool bReadFeatures)
+//{
+//    if( m_bFeatureDefnFinalized )
+//        return;
+//    m_bFeatureDefnFinalized = true;
+//
+//    int nFeatureCountToEstablishFeatureDefn = m_poDS->m_nFeatureCountToEstablishFeatureDefn;
+//    if( !m_osESSearch.empty() && nFeatureCountToEstablishFeatureDefn <= 0 )
+//        nFeatureCountToEstablishFeatureDefn = 1;
+//    std::set< std::pair<CPLString, CPLString> > oVisited;
+//
+//    if( bReadFeatures && nFeatureCountToEstablishFeatureDefn != 0 )
+//    {
+//        //CPLDebug("ES", "Try to get %d features to establish feature definition",
+//        //         FeatureCountToEstablishFeatureDefn);
+//        bool bFirst = true;
+//        int nAlreadyQueried = 0;
+//        while( true )
+//        {
+//            CPLString osRequest;
+//            CPLString osPostData;
+//            if( bFirst )
+//            {
+//                bFirst = false;
+//                if(  !m_osESSearch.empty() )
+//                {
+//                    osRequest = CPLSPrintf("%s/_search?scroll=1m&size=%d",
+//                           m_poDS->GetURL(), m_poDS->m_nBatchSize);
+//                    osPostData = m_osESSearch;
+//                }
+//                else
+//                    osRequest = CPLSPrintf("%s/%s/%s/_search?scroll=1m&size=%d",
+//                           m_poDS->GetURL(), m_osIndexName.c_str(),
+//                           m_osMappingName.c_str(), m_poDS->m_nBatchSize);
+//            }
+//            else
+//            {
+//                if( m_osScrollID.empty() )
+//                    break;
+//                osRequest = CPLSPrintf("%s/_search/scroll?scroll=1m&scroll_id=%s",
+//                               m_poDS->GetURL(), m_osScrollID.c_str());
+//            }
+//
+//            if( m_bAddPretty )
+//                osRequest += "&pretty";
+//            json_object* poResponse = m_poDS->RunRequest(osRequest, osPostData);
+//            if( poResponse == nullptr )
+//            {
+//                break;
+//            }
+//            json_object* poScrollID = CPL_json_object_object_get(poResponse, "_scroll_id");
+//            if( poScrollID )
+//            {
+//                const char* pszScrollID = json_object_get_string(poScrollID);
+//                if( pszScrollID )
+//                    m_osScrollID = pszScrollID;
+//            }
+//
+//            json_object* poHits = json_ex_get_object_by_path(poResponse, "hits.hits");
+//            if( poHits == nullptr || json_object_get_type(poHits) != json_type_array )
+//            {
+//                json_object_put(poResponse);
+//                break;
+//            }
+//            int nHits = json_object_array_length(poHits);
+//            if( nHits == 0 )
+//            {
+//                m_osScrollID = "";
+//                json_object_put(poResponse);
+//                break;
+//            }
+//            for(int i=0;i<nHits;i++)
+//            {
+//                json_object* poHit = json_object_array_get_idx(poHits, i);
+//                if( poHit == nullptr || json_object_get_type(poHit) != json_type_object )
+//                {
+//                    continue;
+//                }
+//                json_object* poSource = CPL_json_object_object_get(poHit, "_source");
+//                if( poSource == nullptr || json_object_get_type(poSource) != json_type_object )
+//                {
+//                    continue;
+//                }
+//
+//                if( !m_osESSearch.empty() )
+//                {
+//                    json_object* poIndex = CPL_json_object_object_get(poHit, "_index");
+//                    if( poIndex == nullptr || json_object_get_type(poIndex) != json_type_string )
+//                        break;
+//                    json_object* poType = CPL_json_object_object_get(poHit, "_type");
+//                    if( poType == nullptr || json_object_get_type(poType) != json_type_string )
+//                        break;
+//                    CPLString osIndex(json_object_get_string(poIndex));
+//                    m_osMappingName = json_object_get_string(poType);
+//
+//                    if( oVisited.find( std::pair<CPLString,CPLString>(osIndex, m_osMappingName) ) == oVisited.end() )
+//                    {
+//                        oVisited.insert( std::pair<CPLString,CPLString>(osIndex, m_osMappingName) );
+//
+//                        json_object* poMappingRes = m_poDS->RunRequest(
+//                            (m_poDS->GetURL() + CPLString("/") + osIndex + CPLString("/_mapping/") + m_osMappingName + CPLString("?pretty")).c_str());
+//                        if( poMappingRes )
+//                        {
+//                            json_object* poLayerObj = CPL_json_object_object_get(poMappingRes, osIndex);
+//                            json_object* poMappings = nullptr;
+//                            if( poLayerObj && json_object_get_type(poLayerObj) == json_type_object )
+//                                poMappings = CPL_json_object_object_get(poLayerObj, "mappings");
+//                            if( poMappings && json_object_get_type(poMappings) == json_type_object )
+//                            {
+//                                json_object* poMapping = CPL_json_object_object_get(poMappings, m_osMappingName);
+//                                if( poMapping)
+//                                {
+//                                    InitFeatureDefnFromMapping(poMapping, "", std::vector<CPLString>());
+//                                }
+//                            }
+//                            json_object_put(poMappingRes);
+//                        }
+//                    }
+//                }
+//
+//                json_object_iter it;
+//                it.key = nullptr;
+//                it.val = nullptr;
+//                it.entry = nullptr;
+//                json_object_object_foreachC( poSource, it )
+//                {
+//                    if( !m_osFID.empty() )
+//                    {
+//                        if( EQUAL(it.key, m_osFID) )
+//                            continue;
+//                    }
+//                    else if( EQUAL(it.key, m_poDS->GetFID()) )
+//                    {
+//                        m_osFID = it.key;
+//                        continue;
+//                    }
+//
+//                    if( m_osMappingName == "FeatureCollection" )
+//                    {
+//                        if( strcmp(it.key, "properties") == 0 &&
+//                            json_object_get_type(it.val) == json_type_object )
+//                        {
+//                            json_object_iter it2;
+//                            it2.key = nullptr;
+//                            it2.val = nullptr;
+//                            it2.entry = nullptr;
+//                            json_object_object_foreachC( it.val, it2 )
+//                            {
+//                                std::vector<CPLString> aosPath;
+//                                aosPath.push_back("properties");
+//                                AddOrUpdateField(it2.key, it2.key, it2.val, '.', aosPath);
+//                            }
+//                        }
+//                    }
+//                    else
+//                    {
+//                        std::vector<CPLString> aosPath;
+//                        AddOrUpdateField(it.key, it.key, it.val, '.', aosPath);
+//                    }
+//                }
+//
+//                nAlreadyQueried ++;
+//                if( nFeatureCountToEstablishFeatureDefn > 0 &&
+//                    nAlreadyQueried >= nFeatureCountToEstablishFeatureDefn )
+//                {
+//                    break;
+//                }
+//            }
+//
+//            json_object_put(poResponse);
+//
+//            if( nFeatureCountToEstablishFeatureDefn > 0 &&
+//                nAlreadyQueried >= nFeatureCountToEstablishFeatureDefn )
+//            {
+//                break;
+//            }
+//        }
+//        ResetReading();
+//    }
+//
+//    if( m_poDS->m_bJSonField )
+//    {
+//        AddFieldDefn("_json", OFTString, std::vector<CPLString>() );
+//    }
+//}
 
 /************************************************************************/
 /*                         BuildPathFromArray()                         */
@@ -855,7 +983,6 @@ OGRErr OGRElasticLayer::SyncToDisk()
 /************************************************************************/
 
 OGRFeatureDefn * OGRElasticLayer::GetLayerDefn() {
-
     FinalizeFeatureDefn();
 
     return m_poFeatureDefn;
@@ -905,15 +1032,17 @@ OGRFeature *OGRElasticLayer::GetNextFeature()
 
     while( true )
     {
-        OGRFeature *poFeature = GetNextRawFeature();
+        OGRFeature *poFeature = GetNextRawFeatureAggregation();
         if( poFeature == nullptr )
             return nullptr;
+        return poFeature;
 
         if( (m_poFilterGeom == nullptr
             || FilterGeometry( poFeature->GetGeomFieldRef(m_iGeomFieldFilter) ) )
             && (m_poAttrQuery == nullptr
-                || m_poAttrQuery->Evaluate( poFeature )) )
-            return poFeature;
+                || m_poAttrQuery->Evaluate( poFeature )) ) {
+                  return poFeature;
+                }
 
         delete poFeature;
     }
@@ -982,6 +1111,151 @@ CPLString OGRElasticLayer::BuildQuery(bool bCountOnly)
     }
     osRet += " }";
     return osRet;
+}
+
+/************************************************************************/
+/*                    GetNextRawFeatureAggregation()                    */
+/************************************************************************/
+
+OGRFeature *OGRElasticLayer::GetNextRawFeatureAggregation()
+{
+    json_object* poResponse = nullptr;
+
+    if( m_bEOF )
+        return nullptr;
+
+    if( m_iCurFeatureInPage < (int)m_apoCachedFeatures.size() )
+    {
+        OGRFeature* poRet = m_apoCachedFeatures[m_iCurFeatureInPage];
+        m_apoCachedFeatures[m_iCurFeatureInPage] = nullptr;
+        m_iCurFeatureInPage ++;
+        return poRet;
+    }
+
+    if ( (int)m_apoCachedFeatures.size() != 0 && m_iCurFeatureInPage == (int)m_apoCachedFeatures.size() )
+    {
+      for(int i=0;i<(int)m_apoCachedFeatures.size();i++)
+          delete m_apoCachedFeatures[i];
+      m_apoCachedFeatures.resize(0);
+      m_bEOF = true;
+      return nullptr;
+    }
+
+    for(int i=0;i<(int)m_apoCachedFeatures.size();i++)
+        delete m_apoCachedFeatures[i];
+    m_apoCachedFeatures.resize(0);
+    m_iCurFeatureInPage = 0;
+
+    CPLString osRequest, osPostData;
+
+    int option = 2;
+    if( option == 1 ) {
+      osRequest = CPLSPrintf("%s/%s/%s/_search?",
+                  m_poDS->GetURL(), m_osIndexName.c_str(),
+                  m_osMappingName.c_str());
+      osPostData = CPLSPrintf(
+        "{\"size\":0,\"aggs\":{\"grid\":{\"geohash_grid\":{\"field\":\"%s\",\"precision\":2},\"aggs\":{\"1\":{\"geo_centroid\":{\"field\":\"%s\"}}}}}}",
+        m_poFeatureDefn->GetGeomFieldDefn(0)->GetNameRef(), m_poFeatureDefn->GetGeomFieldDefn(0)->GetNameRef());
+    } else if( option == 2 ) {
+      osRequest = CPLSPrintf("%s/%s/%s/_search?",
+                  m_poDS->GetURL(), m_osIndexName.c_str(),
+                  m_osMappingName.c_str());
+      osPostData = CPLSPrintf(
+        "{\"size\":0,\"aggs\":{\"grid\":{\"geohash_grid\":{\"field\":\"%s\",\"precision\":3},\"aggs\":{\"1\":{\"geo_centroid\":{\"field\":\"%s\"}}}}}}",
+        m_poFeatureDefn->GetGeomFieldDefn(0)->GetNameRef(), m_poFeatureDefn->GetGeomFieldDefn(0)->GetNameRef());
+    }
+
+    if( m_bAddPretty )
+        osRequest += "&pretty";
+    poResponse = m_poDS->RunRequest(osRequest, osPostData);
+    if( poResponse == nullptr )
+    {
+        m_bEOF = true;
+        return nullptr;
+    }
+    json_object* poAggregations = CPL_json_object_object_get(poResponse, "aggregations");
+    if( poAggregations == nullptr || json_object_get_type(poAggregations) != json_type_object )
+    {
+        m_bEOF = true;
+        json_object_put(poResponse);
+        return nullptr;
+    }
+    json_object* poGrid = CPL_json_object_object_get(poAggregations, "grid");
+    if( poGrid == nullptr || json_object_get_type(poGrid) != json_type_object )
+    {
+        m_bEOF = true;
+        json_object_put(poResponse);
+        return nullptr;
+    }
+    json_object* poBuckets = CPL_json_object_object_get(poGrid, "buckets");
+    if( poBuckets == nullptr || json_object_get_type(poBuckets) != json_type_array )
+    {
+        m_bEOF = true;
+        json_object_put(poResponse);
+        return nullptr;
+    }
+
+    int nBuckets = json_object_array_length(poBuckets);
+    if( nBuckets == 0 )
+    {
+        m_bEOF = true;
+        json_object_put(poResponse);
+        return nullptr;
+    }
+
+    for( int i = 0; i < nBuckets; i++ )
+    {
+        json_object* poBucket = json_object_array_get_idx(poBuckets, i);
+        if( poBucket == nullptr || json_object_get_type(poBucket) != json_type_object )
+        {
+            continue;
+        }
+        json_object* poSource = CPL_json_object_object_get(poBucket, "1");
+        if( poSource == nullptr || json_object_get_type(poSource) != json_type_object )
+        {
+            continue;
+        }
+        json_object* poLocation = CPL_json_object_object_get(poSource, "location");
+        if( poLocation == nullptr || json_object_get_type(poLocation) != json_type_object )
+        {
+            continue;
+        }
+        int pszDensity = 0;
+        json_object* poDensity = CPL_json_object_object_get(poBucket, "doc_count");
+        if( poDensity != nullptr && json_object_get_type(poDensity) == json_type_int )
+            pszDensity = json_object_get_int(poDensity);
+        OGRFeature* poFeature = new OGRFeature(m_poFeatureDefn);
+        json_object* poSourceBuild = BuildJsonFeaturePointWithWeight(poLocation, pszDensity);
+        BuildFeature(poFeature, poSourceBuild, CPLString());
+        if( poFeature->GetFID() < 0 )
+            poFeature->SetFID( ++m_iCurID );
+        m_apoCachedFeatures.push_back(poFeature);
+    }
+
+    json_object_put(poResponse);
+    if( !m_apoCachedFeatures.empty() )
+    {
+        OGRFeature* poRet = m_apoCachedFeatures[ 0 ];
+        m_apoCachedFeatures[ 0 ] = nullptr;
+        m_iCurFeatureInPage ++;
+        return poRet;
+    }
+    return nullptr;
+}
+
+/************************************************************************/
+/*                   BuildJsonFeaturePointWithWeight()                     */
+/************************************************************************/
+
+json_object* OGRElasticLayer::BuildJsonFeaturePointWithWeight(json_object* poLocation,
+                                                            int weight)
+{
+    json_object *obj = json_object_new_object();
+    json_object_object_add(obj, "weight", json_object_new_int(weight));
+    json_object* feature = json_object_new_object();
+    json_object_object_add(feature, m_poFeatureDefn->GetGeomFieldDefn(0)->GetNameRef(), poLocation);
+    json_object_object_add(feature, "properties", obj);
+    return feature;
 }
 
 /************************************************************************/
@@ -1059,6 +1333,7 @@ OGRFeature *OGRElasticLayer::GetNextRawFeature()
         m_bEOF = true;
         return nullptr;
     }
+
     json_object* poScrollID = CPL_json_object_object_get(poResponse, "_scroll_id");
     if( poScrollID )
     {
@@ -1123,7 +1398,9 @@ OGRFeature *OGRElasticLayer::GetNextRawFeature()
         }
 
         if( m_poDS->m_bJSonField )
+        {
             poFeature->SetField("_json", json_object_to_json_string(poSource));
+        }
 
         BuildFeature(poFeature, poSource, CPLString());
         if( poFeature->GetFID() < 0 )
@@ -1456,6 +1733,11 @@ void OGRElasticLayer::BuildFeature(OGRFeature* poFeature, json_object* poSource,
             {
                 BuildFeature(poFeature, it.val, osCurPath);
             }
+        }
+        else if ( json_object_get_type(it.val) == json_type_object && strcmp(it.key, "properties") == 0)
+        {
+            CPLDebug("WARNIG", "WARNING");
+            BuildFeature(poFeature, it.val, osCurPath);
         }
     }
 }
@@ -1988,7 +2270,6 @@ static json_object* GetContainerForFeature( json_object* poContainer,
 
 CPLString OGRElasticLayer::BuildJSonFromFeature(OGRFeature *poFeature)
 {
-
     CPLString fields;
     int nJSonFieldIndex = m_poFeatureDefn->GetFieldIndex("_json");
     if( nJSonFieldIndex >= 0 && poFeature->IsFieldSetAndNotNull(nJSonFieldIndex) )
@@ -2545,7 +2826,7 @@ GIntBig OGRElasticLayer::GetFeatureCount( int bForce )
     {
         if( m_osESSearch[0] != '{' )
             return OGRLayer::GetFeatureCount(bForce);
-        poResponse = m_poDS->RunRequest(
+    poResponse = m_poDS->RunRequest(
             CPLSPrintf("%s/_search?pretty", m_poDS->GetURL()),
             ("{ \"size\": 0, " + m_osESSearch.substr(1)).c_str());
     }
@@ -2654,24 +2935,6 @@ json_object* OGRElasticLayer::GetValue( int nFieldIdx,
 }
 
 /************************************************************************/
-/*                      OGRESGetFieldIndexFromSQL()                     */
-/************************************************************************/
-
-static int OGRESGetFieldIndexFromSQL(const swq_expr_node* poNode)
-{
-    if( poNode->eNodeType == SNT_COLUMN )
-        return poNode->field_index;
-
-    if( poNode->eNodeType == SNT_OPERATION &&
-        poNode->nOperation == SWQ_CAST &&
-        poNode->nSubExprCount >= 1 &&
-        poNode->papoSubExpr[0]->eNodeType == SNT_COLUMN )
-        return poNode->papoSubExpr[0]->field_index;
-
-    return -1;
-}
-
-/************************************************************************/
 /*                        TranslateSQLToFilter()                        */
 /************************************************************************/
 
@@ -2679,7 +2942,6 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
 {
     if( poNode->eNodeType == SNT_OPERATION )
     {
-        int nFieldIdx;
         if( poNode->nOperation == SWQ_AND && poNode->nSubExprCount == 2 )
         {
             // For AND, we can deal with a failure in one of the branch
@@ -2729,6 +2991,8 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
             if( poNode->papoSubExpr[0]->eNodeType == SNT_OPERATION &&
                 poNode->papoSubExpr[0]->nOperation == SWQ_ISNULL &&
                 poNode->papoSubExpr[0]->nSubExprCount == 1 &&
+                poNode->papoSubExpr[0]->papoSubExpr[0]->eNodeType ==
+                                                            SNT_COLUMN &&
                 poNode->papoSubExpr[0]->papoSubExpr[0]->field_index != 0 &&
                 poNode->papoSubExpr[0]->papoSubExpr[0]->field_index <
                                         m_poFeatureDefn->GetFieldCount() )
@@ -2763,13 +3027,15 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
         }
         else if( poNode->nOperation == SWQ_ISNULL &&
                  poNode->nSubExprCount == 1 &&
-                 (nFieldIdx = OGRESGetFieldIndexFromSQL(poNode->papoSubExpr[0])) > 0 &&
-                 nFieldIdx < m_poFeatureDefn->GetFieldCount() )
+                 poNode->papoSubExpr[0]->eNodeType == SNT_COLUMN &&
+                 poNode->papoSubExpr[0]->field_index != 0 &&
+                 poNode->papoSubExpr[0]->field_index <
+                                        m_poFeatureDefn->GetFieldCount() )
         {
             json_object* poRet = json_object_new_object();
             json_object* poExists = json_object_new_object();
             CPLString osFieldName(BuildPathFromArray(
-                m_aaosFieldPaths[nFieldIdx]));
+                m_aaosFieldPaths[ poNode->papoSubExpr[0]->field_index]));
             json_object_object_add(poExists, "field",
                                     json_object_new_string(osFieldName));
             json_object* poBool = json_object_new_object();
@@ -2798,18 +3064,19 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
             }
         }
         else if( poNode->nOperation == SWQ_EQ && poNode->nSubExprCount == 2 &&
+                 poNode->papoSubExpr[0]->eNodeType == SNT_COLUMN &&
                  poNode->papoSubExpr[1]->eNodeType == SNT_CONSTANT &&
-                 (nFieldIdx = OGRESGetFieldIndexFromSQL(poNode->papoSubExpr[0])) >= 0 &&
-                 nFieldIdx < m_poFeatureDefn->GetFieldCount() )
+                 poNode->papoSubExpr[0]->field_index <
+                                        m_poFeatureDefn->GetFieldCount() )
         {
-            json_object* poVal = GetValue(nFieldIdx,
+            json_object* poVal = GetValue(poNode->papoSubExpr[0]->field_index,
                                           poNode->papoSubExpr[1]);
             if( poVal == nullptr )
             {
                 return nullptr;
             }
             json_object* poRet = json_object_new_object();
-            if( nFieldIdx == 0 )
+            if( poNode->papoSubExpr[0]->field_index == 0 )
             {
                 json_object* poIds = json_object_new_object();
                 json_object* poValues = json_object_new_array();
@@ -2821,13 +3088,13 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
             {
                 json_object* poTerm = json_object_new_object();
                 CPLString osPath(BuildPathFromArray(
-                        m_aaosFieldPaths[ nFieldIdx]));
+                        m_aaosFieldPaths[ poNode->papoSubExpr[0]->field_index]));
                 bool bNotAnalyzed = true;
                 if( poNode->papoSubExpr[1]->field_type == SWQ_STRING )
                 {
                     const char* pszFieldName =
                         m_poFeatureDefn->GetFieldDefn(
-                            nFieldIdx)->GetNameRef();
+                            poNode->papoSubExpr[0]->field_index)->GetNameRef();
                     bNotAnalyzed = CSLFindString(m_papszNotAnalyzedFields,
                                                  pszFieldName) >= 0;
                     if( !bNotAnalyzed )
@@ -2864,13 +3131,14 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
         else if( (poNode->nOperation == SWQ_LT ||
                   poNode->nOperation == SWQ_LE ||
                   poNode->nOperation == SWQ_GT ||
-                  poNode->nOperation == SWQ_GE) &&
-                  poNode->nSubExprCount == 2 &&
+                  poNode->nOperation == SWQ_GE) && poNode->nSubExprCount == 2 &&
+                  poNode->papoSubExpr[0]->eNodeType == SNT_COLUMN &&
                   poNode->papoSubExpr[1]->eNodeType == SNT_CONSTANT &&
-                  (nFieldIdx = OGRESGetFieldIndexFromSQL(poNode->papoSubExpr[0])) > 0 &&
-                  nFieldIdx < m_poFeatureDefn->GetFieldCount() )
+                  poNode->papoSubExpr[0]->field_index != 0 &&
+                  poNode->papoSubExpr[0]->field_index <
+                                            m_poFeatureDefn->GetFieldCount() )
         {
-            json_object* poVal = GetValue(nFieldIdx,
+            json_object* poVal = GetValue(poNode->papoSubExpr[0]->field_index,
                                           poNode->papoSubExpr[1]);
             if( poVal == nullptr )
             {
@@ -2881,7 +3149,7 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
             json_object_object_add(poRet, "range", poRange);
             json_object* poFieldConstraint = json_object_new_object();
             CPLString osFieldName(BuildPathFromArray(
-                    m_aaosFieldPaths[nFieldIdx]));
+                    m_aaosFieldPaths[ poNode->papoSubExpr[0]->field_index]));
             json_object_object_add(poRange, osFieldName, poFieldConstraint);
             const char* pszOp = (poNode->nOperation == SWQ_LT) ? "lt" :
                                 (poNode->nOperation == SWQ_LE) ? "lte" :
@@ -2892,18 +3160,20 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
         }
         else if( poNode->nOperation == SWQ_BETWEEN &&
                  poNode->nSubExprCount == 3 &&
+                 poNode->papoSubExpr[0]->eNodeType == SNT_COLUMN &&
                  poNode->papoSubExpr[1]->eNodeType == SNT_CONSTANT &&
                  poNode->papoSubExpr[2]->eNodeType == SNT_CONSTANT &&
-                 (nFieldIdx = OGRESGetFieldIndexFromSQL(poNode->papoSubExpr[0])) > 0 &&
-                 nFieldIdx < m_poFeatureDefn->GetFieldCount() )
+                 poNode->papoSubExpr[0]->field_index != 0 &&
+                 poNode->papoSubExpr[0]->field_index <
+                                            m_poFeatureDefn->GetFieldCount() )
         {
-            json_object* poVal1 = GetValue(nFieldIdx,
+            json_object* poVal1 = GetValue(poNode->papoSubExpr[0]->field_index,
                                           poNode->papoSubExpr[1]);
             if( poVal1 == nullptr )
             {
                 return nullptr;
             }
-            json_object* poVal2 = GetValue(nFieldIdx,
+            json_object* poVal2 = GetValue(poNode->papoSubExpr[0]->field_index,
                                           poNode->papoSubExpr[2]);
             if( poVal2 == nullptr )
             {
@@ -2916,7 +3186,7 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
             json_object_object_add(poRet, "range", poRange);
             json_object* poFieldConstraint = json_object_new_object();
             CPLString osFieldName(BuildPathFromArray(
-                    m_aaosFieldPaths[nFieldIdx]));
+                    m_aaosFieldPaths[ poNode->papoSubExpr[0]->field_index]));
             json_object_object_add(poRange, osFieldName, poFieldConstraint);
             json_object_object_add(poFieldConstraint, "gte", poVal1);
             json_object_object_add(poFieldConstraint, "lte", poVal2);
@@ -2924,8 +3194,9 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
         }
         else if( poNode->nOperation == SWQ_IN &&
                  poNode->nSubExprCount > 1 &&
-                 (nFieldIdx = OGRESGetFieldIndexFromSQL(poNode->papoSubExpr[0])) >= 0 &&
-                 nFieldIdx < m_poFeatureDefn->GetFieldCount() )
+                 poNode->papoSubExpr[0]->eNodeType == SNT_COLUMN &&
+                 poNode->papoSubExpr[0]->field_index <
+                                            m_poFeatureDefn->GetFieldCount() )
         {
             bool bAllConstant = true;
             for( int i=1; i< poNode->nSubExprCount; i++ )
@@ -2939,7 +3210,7 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
             if( bAllConstant )
             {
                 json_object* poRet = json_object_new_object();
-                if( nFieldIdx == 0 )
+                if( poNode->papoSubExpr[0]->field_index == 0 )
                 {
                     json_object* poIds = json_object_new_object();
                     json_object* poValues = json_object_new_array();
@@ -2948,7 +3219,7 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
                         for( int i=1; i< poNode->nSubExprCount; i++ )
                     {
                         json_object* poVal = GetValue(
-                                            nFieldIdx,
+                                            poNode->papoSubExpr[0]->field_index,
                                             poNode->papoSubExpr[i]);
                         if( poVal == nullptr )
                         {
@@ -2962,11 +3233,12 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
                 {
                     bool bNotAnalyzed = true;
                     CPLString osPath(BuildPathFromArray(
-                        m_aaosFieldPaths[nFieldIdx]));
+                        m_aaosFieldPaths[ poNode->papoSubExpr[0]->field_index]));
                     if( poNode->papoSubExpr[1]->field_type == SWQ_STRING )
                     {
                         const char* pszFieldName =
-                            m_poFeatureDefn->GetFieldDefn(nFieldIdx)->
+                            m_poFeatureDefn->GetFieldDefn(
+                                poNode->papoSubExpr[0]->field_index)->
                                                                 GetNameRef();
                         bNotAnalyzed = CSLFindString(m_papszNotAnalyzedFields,
                                                      pszFieldName) >= 0;
@@ -2999,7 +3271,7 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
                         for( int i=1; i< poNode->nSubExprCount; i++ )
                         {
                             json_object* poVal = GetValue(
-                                        nFieldIdx,
+                                        poNode->papoSubExpr[0]->field_index,
                                         poNode->papoSubExpr[i]);
                             if( poVal == nullptr )
                             {
@@ -3018,7 +3290,7 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
                         for( int i=1; i< poNode->nSubExprCount; i++ )
                         {
                             json_object* poVal = GetValue(
-                                        nFieldIdx,
+                                        poNode->papoSubExpr[0]->field_index,
                                         poNode->papoSubExpr[i]);
                             if( poVal == nullptr )
                             {
@@ -3048,19 +3320,21 @@ json_object* OGRElasticLayer::TranslateSQLToFilter(swq_expr_node* poNode)
         }
         else if( poNode->nOperation == SWQ_LIKE &&
                  poNode->nSubExprCount >= 2 &&
-                 (nFieldIdx = OGRESGetFieldIndexFromSQL(poNode->papoSubExpr[0])) > 0 &&
-                 nFieldIdx < m_poFeatureDefn->GetFieldCount() )
+                 poNode->papoSubExpr[0]->eNodeType == SNT_COLUMN &&
+                 poNode->papoSubExpr[0]->field_index != 0 &&
+                 poNode->papoSubExpr[0]->field_index <
+                                            m_poFeatureDefn->GetFieldCount() )
         {
             char chEscape = '\0';
             if( poNode->nSubExprCount == 3 )
                 chEscape = poNode->papoSubExpr[2]->string_value[0];
             const char* pszPattern = poNode->papoSubExpr[1]->string_value;
             const char* pszFieldName = m_poFeatureDefn->GetFieldDefn(
-                    nFieldIdx)->GetNameRef();
+                    poNode->papoSubExpr[0]->field_index)->GetNameRef();
             bool bNotAnalyzed = CSLFindString(m_papszNotAnalyzedFields,
                                               pszFieldName) >= 0;
             CPLString osPath(BuildPathFromArray(
-                    m_aaosFieldPaths[nFieldIdx]));
+                    m_aaosFieldPaths[ poNode->papoSubExpr[0]->field_index]));
             if( !bNotAnalyzed && CSLFindString(m_papszFieldsWithRawValue,
                                                         pszFieldName) >= 0 )
             {

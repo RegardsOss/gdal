@@ -1,5 +1,5 @@
 /******************************************************************************
- * $Id$
+ * $Id: ogr_elastic.h 0143e15c994333ffb95ba270d113ce300661c970 2018-08-10 15:17:07 +0200 Even Rouault $
  *
  * Project:  ElasticSearch Translator
  * Purpose:
@@ -111,6 +111,7 @@ class OGRElasticLayer final: public OGRLayer {
     int                                   m_iCurFeatureInPage;
     std::vector<OGRFeature*>              m_apoCachedFeatures;
     bool                                  m_bEOF;
+    bool                                  bGeoJSONDocument;
 
     json_object*                          m_poSpatialFilter;
     CPLString                             m_osJSONFilter;
@@ -127,6 +128,9 @@ class OGRElasticLayer final: public OGRLayer {
 
     OGRErr                                WriteMapIfNecessary();
     OGRFeature                           *GetNextRawFeature();
+    OGRFeature                           *GetNextRawFeatureAggregation();
+    json_object                          *BuildJsonFeaturePointWithWeight(json_object* poLocation,
+                                                            int weight);
     void                                  BuildFeature(OGRFeature* poFeature,
                                                        json_object* poSource,
                                                        CPLString osPath);

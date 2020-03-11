@@ -35,7 +35,9 @@
 #include "ogrgeojsonreader.h"
 #include "swq.h"
 
-CPL_CVSID("$Id$")
+#include <iostream>
+
+CPL_CVSID("$Id: ogrelasticdatasource.cpp 6f18213f88816a0a39d40b86cb7ec7ccbe55c979 2019-06-10 13:39:10Z jbo-ads $")
 
 /************************************************************************/
 /*                        OGRElasticDataSource()                        */
@@ -598,7 +600,6 @@ json_object* OGRElasticDataSource::RunRequest(const char* pszURL,
         json_object_put(poObj);
         poObj = nullptr;
     }
-
     return poObj;
 }
 
